@@ -156,6 +156,7 @@
       <button class="ghost" id="btnExport">Export JSON</button>
       <button class="primary" id="btnExtract">Extract from URL(s)</button>
       <button class="primary" id="btnOrders">Import order history</button>
+      <button class="primary" id="btnFileImport">Import export files</button>
       <button class="primary" id="btnAdd">+ Add item</button>
     </div>
   </header>
@@ -288,7 +289,42 @@ https://www.vinted.co.uk/items/..."></textarea></div>
   </div>
 </div>
 
+<!-- File import modal (Vinted "download your data" export) -->
+<div class="overlay" id="fileImportOverlay">
+  <div class="modal wide">
+    <h2>Import from export files</h2>
+    <div class="hint">
+      Upload the <code>index.html</code> file(s) and/or PDFs from Vinted's official data export
+      (Settings → "Download your data"). This is heuristic pattern-matching — it looks for prices,
+      dates, and nearby text, since Vinted publishes no fixed spec for this export. Nothing is added
+      until you review and confirm the extracted rows below.
+    </div>
+    <div class="field"><input type="file" id="fileImportInput" multiple accept=".html,.htm,.pdf"></div>
+    <div class="import-status" id="fileImportStatus"></div>
+    <div id="fileImportPreviewWrap"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="cancelFileImport">Cancel</button>
+      <button class="ghost" id="parseFileImport">Parse files</button>
+      <button class="primary" id="commitFileImport" style="display:none;">Add selected to ledger</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script>
+// Storage — plain localStorage, since this is a standalone site (not a
+// Claude.ai artifact preview, where window.storage would apply instead).
+const Storage = {
+  async get(key){
+    const v = localStorage.getItem(key);
+    return v===null ? null : { value: v };
+  },
+  async set(key, value){
+    localStorage.setItem(key, value);
+    return { value };
+  }
+};
+
 let items = [];
 let currentTab = 'all';
 let searchTerm = '';
@@ -299,7 +335,7 @@ const uid = () => 'i_' + Math.random().toString(36).slice(2,10) + Date.now().toS
 
 async function loadItems(){
   try{
-    const res = await window.storage.get('vinted-items', false);
+    const res = await Storage.get('vinted-items');
     items = res && res.value ? JSON.parse(res.value) : [];
   }catch(e){
     items = [];
@@ -309,7 +345,7 @@ async function loadItems(){
 
 async function saveItems(){
   try{
-    await window.storage.set('vinted-items', JSON.stringify(items), false);
+    await Storage.set('vinted-items', JSON.stringify(items));
   }catch(e){
     console.error('Storage save failed', e);
   }
@@ -537,7 +573,7 @@ document.getElementById('btnExport').addEventListener('click', ()=>{
 const settingsOverlay = document.getElementById('settingsOverlay');
 async function loadSettings(){
   try{
-    const res = await window.storage.get('worker-endpoint', false);
+    const res = await Storage.get('worker-endpoint');
     workerEndpoint = res && res.value ? res.value : '';
   }catch(e){ workerEndpoint = ''; }
 }
@@ -548,7 +584,7 @@ document.getElementById('btnSettings').addEventListener('click', ()=>{
 document.getElementById('cancelSettings').addEventListener('click', ()=>settingsOverlay.classList.remove('open'));
 document.getElementById('saveSettings').addEventListener('click', async ()=>{
   workerEndpoint = document.getElementById('s_worker').value.trim().replace(/\/$/,'');
-  await window.storage.set('worker-endpoint', workerEndpoint, false);
+  await Storage.set('worker-endpoint', workerEndpoint);
   settingsOverlay.classList.remove('open');
 });
 
@@ -566,6 +602,7 @@ document.getElementById('btnExtract').addEventListener('click', ()=>{
 document.getElementById('cancelExtract').addEventListener('click', ()=>extractOverlay.classList.remove('open'));
 document.getElementById('runExtract').addEventListener('click', async ()=>{
   const statusEl = document.getElementById('extractStatus');
+  try{
   const urls = document.getElementById('extractUrls').value
     .split('\n').map(u=>u.trim()).filter(u=>u.startsWith('http'));
   if(urls.length===0){ statusEl.textContent='Paste at least one URL.'; statusEl.className='import-status err'; return; }
@@ -609,6 +646,11 @@ document.getElementById('runExtract').addEventListener('click', async ()=>{
   statusEl.className = failed>0 && added===0 ? 'import-status err' : 'import-status ok';
   render();
   if(added>0) setTimeout(()=>{ extractOverlay.classList.remove('open'); }, 1500);
+  }catch(e){
+    console.error('URL extract failed:', e);
+    statusEl.textContent = 'Unexpected error: ' + String(e && e.message || e) + ' (see browser console)';
+    statusEl.className = 'import-status err';
+  }
 });
 
 // Order history import
@@ -617,12 +659,12 @@ let vintedAuth = {};
 
 async function loadAuth(){
   try{
-    const res = await window.storage.get('vinted-auth', false);
+    const res = await Storage.get('vinted-auth');
     vintedAuth = res && res.value ? JSON.parse(res.value) : {};
   }catch(e){ vintedAuth = {}; }
 }
 async function saveAuth(){
-  await window.storage.set('vinted-auth', JSON.stringify(vintedAuth), false);
+  await Storage.set('vinted-auth', JSON.stringify(vintedAuth));
 }
 
 document.getElementById('btnOrders').addEventListener('click', ()=>{
@@ -655,79 +697,296 @@ async function fetchOrderPage(auth, type, page){
 
 document.getElementById('runOrders').addEventListener('click', async ()=>{
   const statusEl = document.getElementById('ordersStatus');
-  const auth = {
-    domain: document.getElementById('o_domain').value.trim() || 'co.uk',
-    access_token: document.getElementById('o_access').value.trim(),
-    xcsrf_token: document.getElementById('o_csrf').value.trim(),
-    refresh_token: document.getElementById('o_refresh').value.trim(),
-    cookie: document.getElementById('o_cookie').value.trim(),
-  };
-  if(!auth.access_token || !auth.xcsrf_token){
-    statusEl.textContent = 'Access token and CSRF token are required.';
-    statusEl.className = 'import-status err';
-    return;
-  }
-  vintedAuth = auth;
-  await saveAuth();
+  try{
+    const auth = {
+      domain: document.getElementById('o_domain').value.trim() || 'co.uk',
+      access_token: document.getElementById('o_access').value.trim(),
+      xcsrf_token: document.getElementById('o_csrf').value.trim(),
+      refresh_token: document.getElementById('o_refresh').value.trim(),
+      cookie: document.getElementById('o_cookie').value.trim(),
+    };
+    if(!auth.access_token || !auth.xcsrf_token){
+      statusEl.textContent = 'Access token and CSRF token are required.';
+      statusEl.className = 'import-status err';
+      return;
+    }
+    vintedAuth = auth;
+    await saveAuth();
 
-  const existingOrderIds = new Set(items.filter(i=>i.orderId).map(i=>i.orderId));
-  let added=0, failedMsg='';
+    const existingOrderIds = new Set(items.filter(i=>i.orderId).map(i=>i.orderId));
+    let added=0, failedMsg='';
 
-  for(const kind of ['purchased','sold']){
-    let page = 1, totalPages = 1;
-    do{
-      statusEl.textContent = `Fetching ${kind} orders — page ${page}${totalPages>1?` of ${totalPages}`:''}...`;
-      statusEl.className = 'import-status';
-      let data;
-      try{
-        data = await fetchOrderPage(auth, kind, page);
-      }catch(e){
-        failedMsg = String(e); break;
-      }
-      if(data.error){ failedMsg = data.error; break; }
-      if(data.refreshed_access_token){
-        auth.access_token = data.refreshed_access_token;
-        vintedAuth.access_token = data.refreshed_access_token;
-        await saveAuth();
-      }
-      (data.orders||[]).forEach(o=>{
-        if(existingOrderIds.has(o.orderId)) return;
-        items.push({
-          id: uid(),
-          title: o.title || 'Untitled',
-          brand: '',
-          status: kind==='sold' ? 'sold' : 'bought',
-          price: parseFloat(o.price)||0,
-          cost: 0,
-          condition: '',
-          colour: '',
-          date: (o.date||'').slice(0,10) || new Date().toISOString().slice(0,10),
-          seller: '',
-          url: '',
-          image: o.image || '',
-          notes: o.transactionStatus ? `Vinted order · ${o.transactionStatus}` : 'Vinted order',
-          orderId: o.orderId,
+    for(const kind of ['purchased','sold']){
+      let page = 1, totalPages = 1;
+      do{
+        statusEl.textContent = `Fetching ${kind} orders — page ${page}${totalPages>1?` of ${totalPages}`:''}...`;
+        statusEl.className = 'import-status';
+        let data;
+        try{
+          data = await fetchOrderPage(auth, kind, page);
+        }catch(e){
+          failedMsg = 'Network/CORS error calling the Worker: ' + String(e && e.message || e);
+          break;
+        }
+        if(data.error){ failedMsg = data.error; break; }
+        if(data.refreshed_access_token){
+          auth.access_token = data.refreshed_access_token;
+          vintedAuth.access_token = data.refreshed_access_token;
+          await saveAuth();
+        }
+        (data.orders||[]).forEach(o=>{
+          if(existingOrderIds.has(o.orderId)) return;
+          items.push({
+            id: uid(),
+            title: o.title || 'Untitled',
+            brand: '',
+            status: kind==='sold' ? 'sold' : 'bought',
+            price: parseFloat(o.price)||0,
+            cost: 0,
+            condition: '',
+            colour: '',
+            date: (o.date||'').slice(0,10) || new Date().toISOString().slice(0,10),
+            seller: '',
+            url: '',
+            image: o.image || '',
+            notes: o.transactionStatus ? `Vinted order · ${o.transactionStatus}` : 'Vinted order',
+            orderId: o.orderId,
+          });
+          existingOrderIds.add(o.orderId);
+          added++;
         });
-        existingOrderIds.add(o.orderId);
-        added++;
-      });
-      totalPages = data.pagination ? data.pagination.total_pages : 1;
-      page++;
-    } while(page <= totalPages);
-    if(failedMsg) break;
-  }
+        totalPages = data.pagination ? data.pagination.total_pages : 1;
+        page++;
+      } while(page <= totalPages);
+      if(failedMsg) break;
+    }
 
-  await saveItems();
-  statusEl.textContent = failedMsg
-    ? `Stopped: ${failedMsg}`
-    : `Imported ${added} order(s) from your Vinted history.`;
-  statusEl.className = failedMsg ? 'import-status err' : 'import-status ok';
-  render();
+    await saveItems();
+    statusEl.textContent = failedMsg
+      ? `Stopped: ${failedMsg}`
+      : `Imported ${added} order(s) from your Vinted history.`;
+    statusEl.className = failedMsg ? 'import-status err' : 'import-status ok';
+    render();
+  }catch(e){
+    console.error('Order import failed:', e);
+    statusEl.textContent = 'Unexpected error: ' + String(e && e.message || e) + ' (see browser console for details)';
+    statusEl.className = 'import-status err';
+  }
 });
 
 loadSettings();
 loadAuth();
 loadItems();
+
+// ---------- File import (Vinted data-export HTML/PDF) ----------
+if (window.pdfjsLib) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+const fileImportOverlay = document.getElementById('fileImportOverlay');
+let fileImportCandidates = [];
+
+document.getElementById('btnFileImport').addEventListener('click', ()=>{
+  document.getElementById('fileImportInput').value = '';
+  document.getElementById('fileImportStatus').textContent = '';
+  document.getElementById('fileImportPreviewWrap').innerHTML = '';
+  document.getElementById('commitFileImport').style.display = 'none';
+  fileImportCandidates = [];
+  fileImportOverlay.classList.add('open');
+});
+document.getElementById('cancelFileImport').addEventListener('click', ()=>fileImportOverlay.classList.remove('open'));
+
+const PRICE_RE = /[£€$]\s?[\d,]+\.\d{2}/;
+const DATE_RE = /\b(\d{1,2}[\/\-. ](?:\d{1,2}|[A-Za-z]{3,9})[\/\-. ]\d{2,4}|\d{4}-\d{2}-\d{2})\b/;
+
+function normalizeDate(raw){
+  if(!raw) return '';
+  const d = new Date(raw);
+  if(!isNaN(d.getTime())) return d.toISOString().slice(0,10);
+  return raw;
+}
+
+// Generic line-based extraction: works for PDF text and non-tabular HTML text.
+function extractFromPlainText(text){
+  const lines = text.split(/\n+/).map(l=>l.trim()).filter(Boolean);
+  const out = [];
+  for(let i=0;i<lines.length;i++){
+    const priceMatch = lines[i].match(PRICE_RE);
+    if(!priceMatch) continue;
+    let date = '';
+    for(let j=Math.max(0,i-2); j<=Math.min(lines.length-1,i+2); j++){
+      const dm = lines[j].match(DATE_RE);
+      if(dm){ date = dm[0]; break; }
+    }
+    let title = lines[i].replace(priceMatch[0],'').trim();
+    if(title.length<3) title = lines[i-1] || lines[i+1] || '';
+    out.push({
+      title: title.slice(0,120),
+      price: priceMatch[0].replace(/[£€$\s]/g,''),
+      date: normalizeDate(date),
+    });
+  }
+  return out;
+}
+
+// Table-based extraction for HTML exports that use <table> rows.
+function extractFromTables(doc){
+  const out = [];
+  doc.querySelectorAll('table').forEach(table=>{
+    table.querySelectorAll('tr').forEach(row=>{
+      const cells = Array.from(row.querySelectorAll('td,th')).map(c=>c.textContent.trim()).filter(Boolean);
+      if(cells.length<2) return;
+      const joined = cells.join(' | ');
+      const priceMatch = joined.match(PRICE_RE);
+      if(!priceMatch) return;
+      const dateMatch = joined.match(DATE_RE);
+      const rest = cells.filter(c=>c!==priceMatch[0] && (!dateMatch || c!==dateMatch[0]));
+      const title = rest.sort((a,b)=>b.length-a.length)[0] || cells[0];
+      out.push({
+        title: title.slice(0,120),
+        price: priceMatch[0].replace(/[£€$\s]/g,''),
+        date: normalizeDate(dateMatch ? dateMatch[0] : ''),
+      });
+    });
+  });
+  return out;
+}
+
+async function parseHtmlFile(file){
+  const text = await file.text();
+  const doc = new DOMParser().parseFromString(text, 'text/html');
+  let rows = extractFromTables(doc);
+  if(rows.length===0){
+    rows = extractFromPlainText(doc.body ? doc.body.innerText : text);
+  }
+  return rows;
+}
+
+async function parsePdfFile(file){
+  if(!window.pdfjsLib){
+    throw new Error('PDF library failed to load — check your internet connection and reload the page.');
+  }
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  let fullText = '';
+  for(let p=1; p<=pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    fullText += content.items.map(it=>it.str).join(' ') + '\n';
+  }
+  return extractFromPlainText(fullText);
+}
+
+function renderFileImportPreview(){
+  const wrap = document.getElementById('fileImportPreviewWrap');
+  if(fileImportCandidates.length===0){
+    wrap.innerHTML = '<div class="hint">No price-shaped rows found in the uploaded file(s).</div>';
+    document.getElementById('commitFileImport').style.display = 'none';
+    return;
+  }
+  const rows = fileImportCandidates.map((c,idx)=>`
+    <tr>
+      <td style="padding:6px;"><input type="checkbox" data-idx="${idx}" class="fi-check" checked></td>
+      <td style="padding:6px;"><input type="text" data-idx="${idx}" data-field="title" value="${escAttr(c.title)}" style="width:100%;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);"></td>
+      <td style="padding:6px;width:90px;"><input type="text" data-idx="${idx}" data-field="price" value="${escAttr(c.price)}" style="width:100%;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);"></td>
+      <td style="padding:6px;width:120px;"><input type="text" data-idx="${idx}" data-field="date" value="${escAttr(c.date)}" style="width:100%;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);"></td>
+      <td style="padding:6px;width:110px;">
+        <select data-idx="${idx}" data-field="status" style="width:100%;padding:6px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px;color:var(--text);">
+          <option value="sold" ${c.status==='sold'?'selected':''}>Sold</option>
+          <option value="bought" ${c.status==='bought'?'selected':''}>Bought</option>
+          <option value="watching" ${c.status==='watching'?'selected':''}>Watching</option>
+        </select>
+      </td>
+    </tr>
+  `).join('');
+  wrap.innerHTML = `
+    <div class="hint">${fileImportCandidates.length} candidate row(s) found. Review, edit, uncheck anything wrong, then add.</div>
+    <div style="max-height:280px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr>
+          <th style="padding:6px;text-align:left;font-size:0.7rem;color:var(--text-faint);"></th>
+          <th style="padding:6px;text-align:left;font-size:0.7rem;color:var(--text-faint);">Title</th>
+          <th style="padding:6px;text-align:left;font-size:0.7rem;color:var(--text-faint);">Price</th>
+          <th style="padding:6px;text-align:left;font-size:0.7rem;color:var(--text-faint);">Date</th>
+          <th style="padding:6px;text-align:left;font-size:0.7rem;color:var(--text-faint);">Status</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+  wrap.querySelectorAll('input[data-field], select[data-field]').forEach(el=>{
+    el.addEventListener('input', ()=>{
+      const idx = Number(el.dataset.idx);
+      fileImportCandidates[idx][el.dataset.field] = el.value;
+    });
+  });
+  document.getElementById('commitFileImport').style.display = 'inline-block';
+}
+
+document.getElementById('parseFileImport').addEventListener('click', async ()=>{
+  const statusEl = document.getElementById('fileImportStatus');
+  const files = Array.from(document.getElementById('fileImportInput').files || []);
+  if(files.length===0){ statusEl.textContent='Choose at least one file.'; statusEl.className='import-status err'; return; }
+  statusEl.textContent = `Parsing ${files.length} file(s)...`;
+  statusEl.className = 'import-status';
+  fileImportCandidates = [];
+  let errors = [];
+
+  for(const file of files){
+    try{
+      let rows = [];
+      if(/\.pdf$/i.test(file.name)) rows = await parsePdfFile(file);
+      else rows = await parseHtmlFile(file);
+      rows.forEach(r=>fileImportCandidates.push({...r, status:'sold', sourceFile:file.name}));
+    }catch(e){
+      console.error('Failed parsing', file.name, e);
+      errors.push(`${file.name}: ${e.message||e}`);
+    }
+  }
+
+  statusEl.textContent = errors.length
+    ? `Parsed with issues — ${errors.join('; ')}`
+    : `Parsed ${files.length} file(s), found ${fileImportCandidates.length} candidate row(s).`;
+  statusEl.className = errors.length ? 'import-status err' : 'import-status ok';
+  renderFileImportPreview();
+});
+
+document.getElementById('commitFileImport').addEventListener('click', async ()=>{
+  const statusEl = document.getElementById('fileImportStatus');
+  try{
+    const checked = document.querySelectorAll('.fi-check:checked');
+    let added = 0;
+    checked.forEach(cb=>{
+      const c = fileImportCandidates[Number(cb.dataset.idx)];
+      if(!c || !c.title) return;
+      items.push({
+        id: uid(),
+        title: c.title,
+        brand: '',
+        status: c.status || 'sold',
+        price: parseFloat(c.price)||0,
+        cost: 0,
+        condition: '',
+        colour: '',
+        date: c.date || new Date().toISOString().slice(0,10),
+        seller: '',
+        url: '',
+        image: '',
+        notes: `Imported from export file (${c.sourceFile||'unknown'})`,
+      });
+      added++;
+    });
+    await saveItems();
+    statusEl.textContent = `Added ${added} item(s) to the ledger.`;
+    statusEl.className = 'import-status ok';
+    render();
+    setTimeout(()=>{ fileImportOverlay.classList.remove('open'); }, 1200);
+  }catch(e){
+    console.error('File import commit failed:', e);
+    statusEl.textContent = 'Unexpected error: ' + String(e && e.message || e);
+    statusEl.className = 'import-status err';
+  }
+});
 </script>
 </body>
 </html>

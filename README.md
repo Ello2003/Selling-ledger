@@ -107,6 +107,35 @@ comfortable scripting the refresh-token flow yourself.
 
 ---
 
+## Fix: storage now uses localStorage, not window.storage
+
+Earlier versions of `site/index.html` used `window.storage`, which is a Claude.ai-artifact-only
+API — it doesn't exist on a standalone site and silently broke every save (including "Import
+order history", which failed with no visible error). This is now fixed: the site uses plain
+browser `localStorage`, which is the correct choice for a self-hosted page. If you deployed an
+earlier copy, replace `site/index.html` with the current version.
+
+## 5. Importing from Vinted's official data export (HTML/PDF)
+
+Vinted's GDPR export (Settings → **Download your data**) gives you a ZIP of HTML files and PDFs —
+there's no published spec for the exact layout, so this feature uses **heuristic pattern-matching**
+(finds a price, looks nearby for a date and a title) rather than a guaranteed-correct parser. Every
+row goes through a preview step where you can edit or uncheck anything before it's added — nothing
+is imported blind.
+
+1. Click **Import export files**.
+2. Upload the `index.html` file(s) from the export (any subfolder that lists transactions/orders),
+   and/or any PDF invoices included in the export.
+3. Click **Parse files** — extracted rows appear in an editable preview table.
+4. Fix any title/price/date that came out wrong, set the correct status per row (defaults to
+   `sold`), untick anything that isn't really an item, then **Add selected to ledger**.
+
+If a file produces zero rows, open it and check whether prices are formatted differently than
+`£12.34` (the parser currently expects `£`/`€`/`$` + two decimals) — let me know the actual format
+and the regex in `parseFileImport`'s `PRICE_RE`/`DATE_RE` (in `site/index.html`) can be adjusted.
+
+---
+
 ## Notes on extraction accuracy
 
 The Worker tries Vinted's embedded page-data JSON first (most reliable), and falls back to
